@@ -1,0 +1,205 @@
+---
+title: "NYPD Shooting Incident Report"
+author: "Hieu Le"
+date: "5/20/2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+### Loading Data and Preprocessing
+
+The NYPD Shooting Incidents (Historic) data is provided by NYC Open Data: https://data.cityofnewyork.us/Public-Safety/NYPD-Shooting-Incident-Data-Historic-/833y-fsy8 
+
+I will start by reading in the data from the four main csv files.
+
+```{r get_nypd_shooting_data}
+library(tidyverse)
+
+url <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+
+nypd_shooting <- read_csv(url)
+
+```
+
+The dataset contains information on shooting incidents in NYC that occurred between 2006 and 2020. Each entry represents a shooting incident in NYC and includes information about the location and time of occurrence, and whether it resulted in a fatality. In addition, information related to the perpetrator and the victim in terms of race, age group, and sex, is also included.Summary statistics of the dataset is as follows.
+
+```{r data_summary}
+summary(nypd_shooting)
+
+```
+
+Check for missing values. It appears that most of the missing data relates to the perpetrator's identity in terms of age, race, and sex. Over 35% of shooting incidents have missing values for perpetrator's race, age group, and sex. This is intuitive since in many shooting incidents the perpetrator would flee the crime scene before the police arrives. And if he/she wore face coverings, there would be no chance for the victim to guesstimate. There is not much a data scientist would be able to do in this situation, other than ignore the observation, i.e. remove shooting incidents with missing data.
+
+Other than perpetrator's identity, Location description accounts for a large number of missing data. It would appear that this variable is not important in solving crimes, and therefore, were omitted in about half of the incidents by the police. However, this could be deduced from the Latitude/Longitude coordinates in the dataset.
+
+```{r check_for_missing_data}
+nrow(nypd_shooting)
+
+colSums(is.na(nypd_shooting))
+
+```
+
+
+The dataset is Tidy with each variable having its own column and each observation (shooting incident) having its own row. Therefore, it is R friendly, and not much transformation is necessary, other than converting chr variables into factor and date formats.Several columns not used in the analysis, such as OCCUR_TIME, LOCATION_DESC, etc., were dropped from the original dataset.
+
+``` {r convert_chr_to_factor}
+library(lubridate)
+
+cols <- c("BORO", "PRECINCT", "JURISDICTION_CODE", 
+          "LOCATION_DESC", "PERP_AGE_GROUP", "PERP_SEX", "PERP_RACE",
+          "VIC_AGE_GROUP", "VIC_SEX", "VIC_RACE")
+
+nypd_shooting_formatted <- nypd_shooting %>%
+  mutate_each_(funs(factor(.)),cols) %>%
+  mutate(OCCUR_DATE = mdy(OCCUR_DATE)) %>%
+  select(-c("OCCUR_TIME", "LOCATION_DESC", "X_COORD_CD", "Y_COORD_CD", "Lon_Lat"))
+
+head(nypd_shooting_formatted)
+
+```
+
+### Data Analysis
+
+Let's take a look at the shooting incidents historical trend. The number of shooting incidents spiked in 2020 in NYC reversing the multi-year reductions in gun violence since 2005. The upturn coincides with the timing of the Covid-19 pandemic. Drastic changes to life, such as a job loss, social distancing measures, and loss of love ones, etc., no doubt could have spurred the spike in shooting incidents.   
+
+``` {r incidident_trends}
+
+incidents_by_year <- nypd_shooting_formatted %>%
+  mutate(YEAR = year(OCCUR_DATE)) %>%
+  group_by(YEAR) %>%
+  summarize(COUNT = n())
+
+incidents_by_year %>%
+  ggplot(aes(YEAR,COUNT)) +
+  geom_point(aes(color="COUNT")) +
+  geom_line(aes(color="COUNT")) +
+  theme(legend.position = "bottom") +
+  labs(title = "New York Shooting Incidents Trend", y = NULL)
+
+```
+
+Looking at the victim's data by race group, it appears that Black and Hispanic residents were unduly impacted by gun violence in 2020.
+
+``` {r victims_by_race}
+
+nypd_shooting_formatted %>%
+  mutate(YEAR = year(OCCUR_DATE)) %>%
+  ggplot(aes(x = YEAR)) +
+  geom_bar(aes(fill = VIC_RACE ))
+
+```
+
+Plotting the locations of shooting incidents on the NYC map, indicates that most shootings occurred in Black and Hispanic neighborhoods of Brooklyn and Bronx. Perhaps these locations were also most impacted by the pandemic. More data is needed to confirm.
+
+``` {r incidents_by_location}
+
+incidents_2020 <- nypd_shooting_formatted %>%
+  filter(OCCUR_DATE > "2019-12-31")
+
+api <- readLines("api_key.txt")
+
+library(ggmap)
+
+register_google(key = api)
+
+NYCMap <- get_map("New York", zoom = 10)
+
+ggmap(NYCMap) +
+  geom_point(aes(x= Longitude, y = Latitude, color = STATISTICAL_MURDER_FLAG),data = incidents_2020) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "mediumblue"))
+
+
+```
+
+### Modeling
+
+It would be nice to have a model that can predict the likelihood of one being shot to death when visiting a certain area of NYC. The K Nearest Neighbors model seems appropriate for this task given the clustering nature of shooting incidents when plotted on the NYC map.
+
+``` {r arima-model}
+
+incidents_hist <- nypd_shooting_formatted %>%
+  filter(OCCUR_DATE < "2020-01-01") %>%
+  mutate(
+    Date = ymd(OCCUR_DATE),
+    Month_Yr = format_ISO8601(Date, precision = "ym")
+  ) %>%
+  group_by(Month_Yr) %>%
+  summarize(COUNT = n())
+
+incidents_actual <- nypd_shooting_formatted %>%
+  filter(OCCUR_DATE > "2020-01-01") %>%
+  mutate(
+    Date = ymd(OCCUR_DATE),
+    Month_Yr = format_ISO8601(Date, precision = "ym")
+  ) %>%
+  group_by(Month_Yr) %>%
+  summarize(COUNT = n())
+
+library(xts)
+library(tseries)
+library(forecast)
+
+incidents_hist_ts = ts(incidents_hist$COUNT, start=c(2006,1), frequency = 12)
+plot(incidents_hist_ts)
+
+# Stationary data tests
+acf(incidents_hist_ts)
+pacf(incidents_hist_ts)
+adf.test(incidents_hist_ts)
+
+# Convert to stationary data
+model = auto.arima(incidents_hist_ts, ic="aic", trace=TRUE)
+acf(ts(model$residuals))
+pacf(ts(model$residuals))
+incidents_forecast <- forecast(model, level = c(95), h = 12)
+
+Box.test(incidents_forecast$residuals, lag=5, type="Ljung-Box")
+Box.test(incidents_forecast$residuals, lag=10, type="Ljung-Box")
+Box.test(incidents_forecast$residuals, lag=15, type="Ljung-Box")
+Box.test(incidents_forecast$residuals, lag=20, type="Ljung-Box")
+Box.test(incidents_forecast$residuals, lag=30, type="Ljung-Box")
+
+library(sweep)
+
+incidents_forecast_df <- incidents_forecast %>% 
+  sweep::sw_sweep(.) %>% 
+  filter(key == "forecast") %>% 
+  select(-key) %>%
+  mutate(Month_Yr = format(index, "%Y-%m"))
+
+sum(incidents_forecast_df$value)
+
+incidents_hist_by_year <- nypd_shooting_formatted %>%
+  mutate(YEAR = year(OCCUR_DATE)) %>%
+  group_by(YEAR) %>%
+  summarize(COUNT = n())
+
+ggplot() +
+  geom_line(data = incidents_hist, aes(Month_Yr, COUNT), color = "blue")
+
+```
+
+
+
+
+### Conclusion
+
+The analysis of the dataset shows there is a spike in gun violence in 2020 most likely driven by the pandemic shock. Black and Hispanic communities of Brooklyn and Bronx were disproportionately impacted by the upturn in violent crime.
+
+The KNN model in this analysis attempts to predict the likelihood of one being killed by gun violence at a specified location of NYC based on Latitude and Longtime coordinates. The model has a high error term of 20%. The confusion matrix shows that the model is less that 1% accurate at predicting death. More data is needed, other than just location coordinates, in order to train a more accurate model.
+
+### Bias
+
+The source of potential bias using the dataset stems from missing values. A large number of incidents do not have information about the perpetrator. Using the dateset alone to perform data analysis is problematic. Perhaps more data is needed such as income levels, covid-19 testing positivity rates, etc., to conduct any meaningful analysis.
+
+``` {r session_info}
+library(pander)
+pander(sessionInfo())
+
+```
+
