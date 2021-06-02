@@ -1,0 +1,294 @@
+---
+title: "NYPD Shooting Incident Report"
+author: "Hieu Le"
+date: "5/20/2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+
+
+### Project Setup
+
+Loading the necessary libraries.
+
+``` {r libraries}
+library(tidyverse)
+library(lubridate)
+
+library(ggmap)
+api <- readLines("api_key.txt") # Register your own api key on Google Maps Platform
+register_google(key = api)
+
+library(xts)
+library(tseries)
+library(forecast)
+library(sweep)
+
+```
+
+
+Read the data form the main csv source. The NYPD Shooting Incidents (Historic) data is provided by NYC OpenData: https://data.cityofnewyork.us/Public-Safety/NYPD-Shooting-Incident-Data-Historic-/833y-fsy8.
+
+```{r get_nypd_shooting_data}
+
+
+url <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+
+nypd_shooting <- read_csv(url)
+
+```
+
+The dataset contains information on shooting incidents in NYC that occurred between 2006 and 2020. Each entry represents a shooting incident in NYC and includes information about the location and time of occurrence, and whether it resulted in a fatality. In addition, information related to the perpetrator and the victim in terms of race, age group, and sex, is also included. Summary statistics of the dataset is as follows.
+
+```{r data_summary}
+summary(nypd_shooting)
+
+```
+
+## Data Maniputation and Cleaning
+
+The dataset is Tidy with each variable having its own column and each observation (shooting incident) having its own row. Therefore, it is R friendly, and no further manipulation is necessary, other than converting chr type variables into factor and date types. Several columns not used in the analysis, such as OCCUR_TIME, LOCATION_DESC, etc., are dropped.
+
+``` {r convert_chr_to_factor}
+
+
+cols <- c("BORO", "PRECINCT", "JURISDICTION_CODE", 
+          "LOCATION_DESC", "PERP_AGE_GROUP", "PERP_SEX", "PERP_RACE",
+          "VIC_AGE_GROUP", "VIC_SEX", "VIC_RACE")
+
+nypd_shooting_formatted <- nypd_shooting %>%
+  mutate_each_(funs(factor(.)),cols) %>%
+  mutate(OCCUR_DATE = mdy(OCCUR_DATE)) %>%
+  select(-c("OCCUR_TIME", "LOCATION_DESC", "X_COORD_CD", "Y_COORD_CD", "Lon_Lat"))
+
+head(nypd_shooting_formatted)
+
+```
+
+
+Let's check for missing values. It appears that most of the missing data relates to the perpetrator's identity. Over 35% of shooting incidents have missing values for perpetrator's race, age group, and sex. This is intuitive since in many shooting incidents the perpetrator would flee the crime scene before the police arrives and many would manage to remain at large. 
+
+```{r check_for_missing_data}
+
+missing_values <- nypd_shooting_formatted %>%
+    gather(key = "key", value = "val") %>%
+    mutate(is.missing = is.na(val)) %>%
+    group_by(key, is.missing) %>%
+    summarise(num.missing = n()) %>%
+    filter(is.missing==T) %>%
+    select(-is.missing) %>%
+    arrange(desc(num.missing))
+
+missing_values <- nypd_shooting_formatted %>%
+  gather(key = "key", value = "val") %>%
+  mutate(isna = is.na(val)) %>%
+  group_by(key) %>%
+  mutate(total = n()) %>%
+  group_by(key, total, isna) %>%
+  summarise(num.isna = n()) %>%
+  mutate(pct = num.isna / total * 100)
+
+levels <-
+    (missing_values  %>% filter(isna == T) %>% arrange(desc(pct)))$key
+
+missing_values %>%
+      ggplot() +
+        geom_bar(aes(x = reorder(key, desc(pct)), 
+                     y = pct, fill=isna), 
+                 stat = 'identity', alpha=0.8) +
+      scale_x_discrete(limits = levels) +
+      scale_fill_manual(name = "", 
+                        values = c('steelblue', 'tomato3'), labels = c("Present", "Missing")) +
+      coord_flip() +
+      labs(title = "Percentage of missing values", x =
+             'Variable', y = "% of missing values")
+```
+
+
+There are a couple of ways we can deal with missing data:
+
+1. Remove the incidents with missing values from the dataset. This would work if the number of incidents with missing data is small relative to the total number of observations. However, in this case over 35% of the observations had missing values for perpetrator's race, age group, and sex. Removing this many incidents from the dataset would have resulted in a massive loss of information.
+
+2. Imputation. In this analysis I used mode imputation to fill in the missing data points. It is basically substituting the NAs with the most frequent occurrence for the variable in the dataset. It appears that the majority of shooting incidents in the dataset were committed by male perpetrators ages between 18-44. Within this sub-group, the majority of perpetrators were black. So, we are going to subsitute all NAs for PERP_RACE column with the value of "BLACK".
+
+``` {r handling_of_missing_data}
+
+nypd_shooting_formatted %>%
+  group_by(PERP_SEX) %>%
+  summarize(frequency = n()) %>%
+  filter(frequency > 1) %>%
+  ggplot(aes(x = PERP_SEX, y = frequency)) +
+  geom_col(fill = "navy")
+
+nypd_shooting_formatted %>%
+  group_by(PERP_AGE_GROUP) %>%
+  summarize(frequency = n()) %>%
+  filter(frequency > 1) %>%
+  ggplot(aes(x = PERP_AGE_GROUP, y = frequency)) +
+  geom_col(fill = "navy")
+
+nypd_shooting_formatted %>%
+  filter(PERP_SEX == "M") %>%
+  filter(PERP_AGE_GROUP == "18-24" | PERP_AGE_GROUP == "25-44") %>%
+  group_by(PERP_RACE) %>%
+  summarize(frequency = n()) %>%
+  ggplot(aes(x = PERP_RACE, y = frequency)) +
+  geom_col(fill = "navy") + 
+  theme(axis.text.x = element_text(angle = 90))
+
+nypd_shooting_formatted$PERP_RACE[is.na(nypd_shooting_formatted$PERP_RACE)] <- "BLACK"
+nypd_shooting_formatted$PERP_RACE[nypd_shooting_formatted$PERP_RACE == "UNKNOWN"] <- "BLACK"
+
+```
+
+
+### Expolatory Data Analysis
+
+Let's take a look at the shooting incidents historical trend. The number of shooting incidents spiked in 2020 in NYC reversing the multi-year reductions in gun violence since 2006. The upturn coincides with the timing of the Covid-19 pandemic. Drastic changes to life, such as a job loss, social distancing measures, and loss of love ones, etc., no doubt could have spurred the spike in shooting incidents.   
+
+``` {r incidident_trends}
+
+incidents_by_year <- nypd_shooting_formatted %>%
+  mutate(YEAR = year(OCCUR_DATE)) %>%
+  group_by(YEAR) %>%
+  summarize(COUNT = n())
+
+incidents_by_year %>%
+  ggplot(aes(YEAR,COUNT)) +
+  geom_point(aes(color="COUNT")) +
+  geom_line(aes(color="COUNT")) +
+  theme(legend.position = "bottom") +
+  labs(title = "New York Shooting Incidents Trend", y = NULL)
+
+```
+
+Breaking down the trend by race, it appears that Black and Hispanic were most frequent in committing gun violence in 2020. Which is consistent with the historical trend. It is also consistent with the premise that Covid-19 had disproportionately impacted Black and Hispanic communities of NYC. 
+
+``` {r perp_by_race}
+
+nypd_shooting_formatted %>%
+  mutate(YEAR = year(OCCUR_DATE)) %>%
+  ggplot(aes(x = YEAR)) +
+  geom_bar(aes(fill = PERP_RACE ))
+
+```
+
+Plotting the locations of shooting incidents on the NYC map, confirms that most shooting incidents occurred in Black and Hispanic neighborhoods of Brooklyn and Bronx. It is likely that these locations were also most impacted by the pandemic.
+
+``` {r incidents_by_location}
+
+incidents_2020 <- nypd_shooting_formatted %>%
+  filter(OCCUR_DATE > "2019-12-31")
+
+NYCMap <- get_map("New York", zoom = 10)
+
+ggmap(NYCMap) +
+  geom_point(aes(x= Longitude, y = Latitude, color = STATISTICAL_MURDER_FLAG),data = incidents_2020) +
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "mediumblue"))
+
+
+```
+
+### Data Modeling
+
+The goal of modeling the data is to estimate the impact Covid-19 had on the spike in the number of shooting incidents in NYC in 2020.
+
+The approach is to forecast the number of incidents in 2020 using historical data assuming no knowledge of Covid-19. Compare the predicted vs. actual number of incidents. And attribute any difference to Covid-19.
+
+Given that the dataset is a time series, the Autoregressive Integrated Moving Average (ARIMA) model was used for forecasting which accounts for autocorrelation and seasonality.
+
+``` {r arima_model}
+
+# Historical time series. Shooting incidents occurred prior to 2020
+
+incidents_hist <- nypd_shooting_formatted %>%
+  filter(OCCUR_DATE < "2020-01-01") %>%
+  mutate(
+    Date = ymd(OCCUR_DATE),
+    Month_Yr = format_ISO8601(Date, precision = "ym")
+  ) %>%
+  group_by(Month_Yr) %>%
+  summarize(COUNT = n())
+
+# Actual incidents occurred in 2020
+
+incidents_actual <- nypd_shooting_formatted %>%
+  filter(OCCUR_DATE > "2020-01-01") %>%
+  mutate(
+    Date = ymd(OCCUR_DATE),
+    Month_Yr = format_ISO8601(Date, precision = "ym")
+  ) %>%
+  group_by(Month_Yr) %>%
+  summarize(COUNT = n())
+
+# Covert the historical time series data into a ts object for time series analysis
+
+incidents_hist_ts = ts(incidents_hist$COUNT, start=c(2006,1), frequency = 12)
+plot(incidents_hist_ts)
+
+# Test the time series for stationarity. The historical time series data is non-stationary
+acf(incidents_hist_ts)
+pacf(incidents_hist_ts)
+adf.test(incidents_hist_ts)
+
+# Fit the ARIMA model, test the model for stationarity
+model = auto.arima(incidents_hist_ts, ic="aic", trace=TRUE)
+acf(ts(model$residuals))
+pacf(ts(model$residuals))
+
+# Predict the number of shooting incidents in 2020 using the model
+incidents_forecast <- forecast(model, level = c(95), h = 12)
+
+# Additional tests for stationarity. p-values > 0.05 at various lags indicates the time series is stationary.
+Box.test(incidents_forecast$residuals, lag=5, type="Ljung-Box")
+Box.test(incidents_forecast$residuals, lag=10, type="Ljung-Box")
+Box.test(incidents_forecast$residuals, lag=15, type="Ljung-Box")
+Box.test(incidents_forecast$residuals, lag=20, type="Ljung-Box")
+Box.test(incidents_forecast$residuals, lag=30, type="Ljung-Box")
+
+# Plot the forecast
+plot(incidents_forecast)
+
+# Convert the predicted time series to dataframe
+incidents_forecast_df <- incidents_forecast %>% 
+  sweep::sw_sweep(.) %>% 
+  filter(key == "forecast") %>% 
+  select(-key) %>%
+  mutate(Month_Yr = format(index, "%Y-%m"))
+
+# Predicted number of shooting incidents in 2020
+sum(incidents_forecast_df$value)
+
+# Actual incidents in 2020
+nypd_shooting_formatted %>%
+  mutate(YEAR = year(OCCUR_DATE)) %>%
+  group_by(YEAR) %>%
+  summarize(COUNT = n()) %>%
+  filter(YEAR == "2020")
+
+```
+
+
+### Conclusion
+
+The ARIMA model predicted 854 shooting incidents in 2020 using historical data only, assuming no prior knowledge of Covid-19. Compared to 1,942 incidents actually occurred in 2020. That is more than twice the prediction!
+
+While we may never know how 2020 would turn out to be without Covid-19, one thing for sure, the world would be a much difference place. And that is essentially the sentiment the model was able to captured. 
+
+In coming up with the conclusion, I have to be mindful of various biases:
+1. The imputation method used creates a bias against black people.
+2. My personal disdain for Covid-19 may have influence the direction I took for this project.
+3. Using historical data to forecast the future ignores other underlying factors driving the number of shooting incidents.
+
+``` {r session_info}
+library(pander)
+pander(sessionInfo())
+
+```
+
